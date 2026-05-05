@@ -37,7 +37,7 @@ import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
 
-from lerobot.datasets.pyav_utils import (
+from .pyav_utils import (
     check_video_encoder_config_pyav,
     detect_available_encoders_pyav,
 )
