@@ -37,11 +37,12 @@ import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
 
+from lerobot.utils.import_utils import get_safe_default_video_backend
+
 from .pyav_utils import (
     check_video_encoder_config_pyav,
     detect_available_encoders_pyav,
 )
-from lerobot.utils.import_utils import get_safe_default_video_backend
 
 logger = logging.getLogger(__name__)
 
