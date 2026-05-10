@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Read(//c/Users/moe-z/.cache/huggingface/lerobot/calibration/**)",
+      "Read(//c/Projects/**)"
+    ]
+  }
+}
