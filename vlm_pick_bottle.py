@@ -142,7 +142,7 @@ parser.add_argument("--hz",            type=float, default=10.0,
 parser.add_argument("--scan-timeout",  type=float, default=30.0,
                     help="Seconds to wait for a bottle detection")
 parser.add_argument("--no-arm",        action="store_true")
-parser.add_argument("--camera-index",  type=int, default=4,
+parser.add_argument("--camera-index",  type=int, default=3,
                     help="OpenCV camera index for UVC fallback (default: 4)")
 parser.add_argument("--action",        choices=["place", "flip"], default="place",
                     help="What to do after grasping: place (A→B) or flip the bottle")
@@ -150,6 +150,21 @@ parser.add_argument("--flip-speed",    type=float, default=300.0,
                     help="Flip stroke speed in deg/s (default 300)")
 parser.add_argument("--no-preview",    action="store_true",
                     help="Disable the live cv2 preview window")
+# ── inference grasping ────────────────────────────────────────────────────────
+parser.add_argument("--inference-grasp", action="store_true",
+                    help="Visual servo to bottle instead of using fixed grasp waypoint")
+parser.add_argument("--grasp-depth",    type=float, default=0.12, dest="servo_target_depth",
+                    help="Depth (m) at which servo closes gripper (default 0.12)")
+parser.add_argument("--pan-joint",      type=int,   default=5,   dest="servo_pan_joint",
+                    help="Joint index for camera pan / horizontal centering (default 5)")
+parser.add_argument("--tilt-joint",     type=int,   default=4,   dest="servo_tilt_joint",
+                    help="Joint index for camera tilt / vertical centering (default 4)")
+parser.add_argument("--reach-joint",    type=int,   default=2,   dest="servo_reach_joint",
+                    help="Joint index that extends arm toward target (default 2)")
+parser.add_argument("--pixel-gain",     type=float, default=4e-4, dest="servo_pixel_gain",
+                    help="Servo gain: rad/pixel for centering (default 4e-4)")
+parser.add_argument("--depth-gain",     type=float, default=0.5,  dest="servo_depth_gain",
+                    help="Servo gain: rad/(m·s) for approach — negate to flip direction (default 0.5)")
 args = parser.parse_args()
 
 USE_ARM  = not args.no_arm and HAS_CAN
@@ -440,6 +455,74 @@ class YOLOv8Detector:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Continuous live detector (background thread — always feeds preview)
+# ════════════════════════════════════════════════════════════════════════════
+
+class LiveDetector:
+    """
+    Runs YOLOv8 in a daemon thread at ~30 fps so the preview is always live,
+    even while the arm is moving.  Use wait_for_bottle() to block until a
+    confident detection with depth is available.
+    """
+
+    def __init__(self, camera, detector: YOLOv8Detector, conf: float,
+                 preview: "PreviewWindow | None" = None):
+        self._camera   = camera
+        self._detector = detector
+        self._conf     = conf
+        self._preview  = preview
+        self._best: dict | None = None
+        self._lock     = threading.Lock()
+        self._event    = threading.Event()
+        self._running  = True
+        self._thread   = threading.Thread(target=self._loop, daemon=True, name="live-det")
+        self._thread.start()
+
+    def _loop(self):
+        while self._running:
+            color, _ = self._camera.get_frames()
+            if color is None:
+                time.sleep(0.02)
+                continue
+            dets  = self._detector.detect(color, conf=self._conf)
+            entry = None
+            if dets:
+                best  = max(dets, key=lambda d: d["score"])
+                pos3d = self._camera.bottle_3d(best["box"])
+                entry = {**best, "pos3d": pos3d, "frame": color.copy()}
+                self._event.set()
+            with self._lock:
+                self._best = entry
+            if self._preview:
+                if entry:
+                    self._preview.update(color, dets, entry.get("pos3d"),
+                                         f"LIVE  score={entry['score']:.2f}")
+                else:
+                    self._preview.update_plain(color, "scanning…")
+            time.sleep(0.03)
+
+    def get_best(self) -> "dict | None":
+        with self._lock:
+            return self._best
+
+    def wait_for_bottle(self, timeout: float) -> "dict | None":
+        """Block until a detection with 3D position is available, or timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            b = self.get_best()
+            if b and b.get("pos3d"):
+                return b
+            remaining = deadline - time.time()
+            self._event.wait(timeout=min(0.1, remaining))
+            self._event.clear()
+        return None
+
+    def stop(self):
+        self._running = False
+        self._thread.join(timeout=2.0)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Live preview window (cv2, runs in background thread)
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -509,6 +592,7 @@ class PreviewWindow:
 
 def move_to(follower, current_cmd: np.ndarray, target: np.ndarray,
             hz: float = 10.0, speed: float = MAX_SPEED_RAD) -> np.ndarray:
+    """Move arm joints to target, gripper tracks target[-1]."""
     dt       = 1.0 / hz
     max_step = speed * dt
     cmd      = current_cmd.copy()
@@ -522,14 +606,38 @@ def move_to(follower, current_cmd: np.ndarray, target: np.ndarray,
     return cmd
 
 
+def move_to_closing(follower, current_cmd: np.ndarray, target: np.ndarray,
+                    gripper_target: float, hz: float = 10.0,
+                    speed: float = MAX_SPEED_RAD) -> np.ndarray:
+    """Move arm to target while simultaneously closing/opening gripper.
+    Gripper starts moving immediately and reaches gripper_target by the
+    time the arm arrives — so the hand is already gripping on contact.
+    """
+    dt         = 1.0 / hz
+    max_step   = speed * dt
+    grip_step  = max_step * 4   # gripper moves faster than arm joints
+    cmd        = current_cmd.copy()
+    while True:
+        arm_delta  = target[:-1] - cmd[:-1]
+        grip_delta = gripper_target - cmd[-1]
+        arm_done   = np.max(np.abs(arm_delta)) < 0.005
+        grip_done  = abs(grip_delta) < 0.01
+        if arm_done and grip_done:
+            break
+        cmd[:-1] += np.clip(arm_delta, -max_step, max_step)
+        cmd[-1]  += np.clip(grip_delta, -grip_step, grip_step)
+        follower.command_joint_pos(cmd)
+        time.sleep(dt)
+    return cmd
+
+
 def set_gripper(follower, current_cmd: np.ndarray, value: float, hz: float = 10.0) -> np.ndarray:
-    target      = current_cmd.copy()
-    target[-1]  = value
-    dt          = 1.0 / hz
-    max_step    = MAX_SPEED_RAD * dt * 3   # gripper moves faster
-    cmd         = current_cmd.copy()
-    while abs(target[-1] - cmd[-1]) > 0.01:
-        cmd[-1] += np.clip(target[-1] - cmd[-1], -max_step, max_step)
+    """Open or close gripper only, arm stays put."""
+    dt        = 1.0 / hz
+    grip_step = MAX_SPEED_RAD * dt * 4
+    cmd       = current_cmd.copy()
+    while abs(value - cmd[-1]) > 0.01:
+        cmd[-1] += np.clip(value - cmd[-1], -grip_step, grip_step)
         follower.command_joint_pos(cmd)
         time.sleep(dt)
     return cmd
@@ -614,74 +722,140 @@ def teach_mode(follower, out_path: str, hz: float = 10.0):
 # ════════════════════════════════════════════════════════════════════════════
 
 def scan_for_bottle(
-    camera: GeminiCamera,
-    detector: YOLOv8Detector,
-    preview: "PreviewWindow | None",
-    conf: float,
+    live_det: LiveDetector,
     timeout: float,
-) -> dict | None:
-    """
-    Runs YOLO on Gemini color frames.  Returns the best detection dict
-    {score, box, pos3d} or None if timeout expires.
-    """
-    print(f"\nScanning for bottles (conf≥{conf}, timeout {timeout:.0f}s)…")
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        color, depth = camera.get_frames()
-        if color is None:
-            time.sleep(0.05)
-            continue
-
-        dets = detector.detect(color, conf=conf)
-
-        if dets:
-            best  = max(dets, key=lambda d: d["score"])
-            pos3d = camera.bottle_3d(best["box"])
-            best["pos3d"] = pos3d
-
-            if pos3d:
-                x, y, z = pos3d
-                print(f"\n  BOTTLE  score={best['score']:.2f}  "
-                      f"x={x:+.3f} y={y:+.3f} z={z:.3f} m (camera frame)")
-            else:
-                print(f"\n  BOTTLE  score={best['score']:.2f}  (no depth)")
-
-            if preview:
-                preview.update(color, dets, pos3d,
-                               f"DETECTED score={best['score']:.2f}")
-            return best
-
-        remaining = deadline - time.time()
-        if preview:
-            preview.update_plain(color, f"scanning… {remaining:.0f}s")
+) -> "dict | None":
+    """Wait for LiveDetector to report a bottle with a valid 3D position."""
+    print(f"\nScanning for bottles (timeout {timeout:.0f}s)…")
+    result = live_det.wait_for_bottle(timeout)
+    if result:
+        pos3d = result.get("pos3d")
+        if pos3d:
+            x, y, z = pos3d
+            print(f"  BOTTLE  score={result['score']:.2f}  "
+                  f"x={x:+.3f} y={y:+.3f} z={z:.3f} m (camera frame)")
         else:
-            print(f"\r  no bottle — {remaining:.0f}s", end="", flush=True)
-
-        time.sleep(0.05)
-
-    print("\nTimeout — no bottle found.")
-    return None
+            print(f"  BOTTLE  score={result['score']:.2f}  (no depth)")
+    else:
+        print("Timeout — no bottle found.")
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # Action sequences
 # ════════════════════════════════════════════════════════════════════════════
 
-def _grasp(follower, wp, hz) -> np.ndarray:
-    """Shared preamble: home → pre_grasp → grasp → close gripper."""
-    cmd = follower.get_joint_pos().copy()
-    for label, key in [("HOME", "home"), ("PRE-GRASP A", "pre_grasp_a"), ("GRASP A", "grasp_a")]:
-        print(f"  → {label}")
-        cmd = move_to(follower, cmd, wp[key], hz=hz)
-    print("  → Close gripper")
+def servo_to_grasp(
+    live_det: LiveDetector,
+    follower,
+    cmd: np.ndarray,
+    hz: float,
+    pan_joint:    int   = 5,
+    tilt_joint:   int   = 4,
+    reach_joint:  int   = 2,
+    target_depth: float = 0.12,
+    pixel_gain:   float = 4e-4,
+    depth_gain:   float = 0.5,
+    max_steps:    int   = 300,
+    px_tol:       float = 25.0,
+    depth_tol:    float = 0.015,
+) -> tuple[np.ndarray, bool]:
+    """
+    Image-based visual servo: center the bottle in-frame, then drive the arm
+    forward until depth ≤ target_depth, then close the gripper.
+
+    Joint mapping (tune with --pan-joint / --tilt-joint / --reach-joint):
+      pan_joint   — rotates camera left/right  (nulls pixel error X)
+      tilt_joint  — rotates camera up/down     (nulls pixel error Y)
+      reach_joint — extends arm toward target  (nulls depth error)
+                    Negate --depth-gain if the arm moves away instead.
+
+    Per-step joint change is clamped to ±5° so the arm cannot lurch.
+    """
+    print(f"  [servo] approaching bottle  target_depth={target_depth:.3f} m")
+    dt       = 1.0 / hz
+    n_joints = len(cmd) - 1   # exclude gripper
+
+    for step in range(max_steps):
+        det = live_det.get_best()
+        if det is None:
+            print("  [servo] bottle lost — aborting")
+            return cmd, False
+
+        x1, y1, x2, y2 = det["box"]
+        frame  = det["frame"]
+        img_h, img_w = frame.shape[:2]
+        e_x = (x1 + x2) / 2.0 - img_w / 2.0   # + → bottle right of centre
+        e_y = (y1 + y2) / 2.0 - img_h / 2.0   # + → bottle below centre
+
+        pos3d = det.get("pos3d")
+        e_z   = (pos3d[2] - target_depth) if pos3d else 0.0   # + → too far
+
+        if abs(e_x) < px_tol and abs(e_y) < px_tol and abs(e_z) < depth_tol:
+            print(f"  [servo] converged at step {step} — closing gripper")
+            cmd = set_gripper(follower, cmd, GRIPPER_CLOSED, hz=hz)
+            time.sleep(0.3)
+            return cmd, True
+
+        q = cmd.copy()
+        if pan_joint < n_joints:
+            q[pan_joint]  -= pixel_gain * e_x
+        if tilt_joint < n_joints:
+            q[tilt_joint] += pixel_gain * e_y
+        if reach_joint < n_joints and pos3d:
+            q[reach_joint] -= depth_gain * e_z * dt
+
+        q = np.clip(q, cmd - np.radians(5), cmd + np.radians(5))
+        follower.command_joint_pos(q)
+        cmd = q
+        time.sleep(dt)
+
+    print("  [servo] max steps reached — closing gripper anyway")
     cmd = set_gripper(follower, cmd, GRIPPER_CLOSED, hz=hz)
-    time.sleep(0.4)
+    return cmd, False
+
+
+def _grasp(follower, wp, hz,
+           live_det: "LiveDetector | None" = None,
+           use_inference: bool = False,
+           servo_args=None) -> np.ndarray:
+    """
+    home → pre_grasp_a → then either:
+      • visual servo to bottle and close gripper  (--inference-grasp)
+      • descend to grasp_a waypoint closing gripper on the way (default)
+    """
+    cmd = follower.get_joint_pos().copy()
+
+    print("  → HOME")
+    cmd = move_to(follower, cmd, wp["home"], hz=hz)
+
+    print("  → PRE-GRASP A  (gripper open)")
+    cmd = move_to(follower, cmd, wp["pre_grasp_a"], hz=hz)
+
+    if use_inference and live_det is not None:
+        cmd, ok = servo_to_grasp(
+            live_det, follower, cmd, hz,
+            pan_joint    = servo_args.servo_pan_joint,
+            tilt_joint   = servo_args.servo_tilt_joint,
+            reach_joint  = servo_args.servo_reach_joint,
+            target_depth = servo_args.servo_target_depth,
+            pixel_gain   = servo_args.servo_pixel_gain,
+            depth_gain   = servo_args.servo_depth_gain,
+        )
+        if not ok:
+            print("  WARNING: servo grasp failed — falling back to fixed grasp_a")
+            cmd = move_to_closing(follower, cmd, wp["grasp_a"], GRIPPER_CLOSED, hz=hz)
+            time.sleep(0.3)
+    else:
+        print("  → GRASP A  (closing gripper on the way down)")
+        cmd = move_to_closing(follower, cmd, wp["grasp_a"], GRIPPER_CLOSED, hz=hz)
+        time.sleep(0.3)
     return cmd
 
 
-def pick_and_place(follower, wp: dict[str, np.ndarray], hz: float) -> np.ndarray:
-    cmd = _grasp(follower, wp, hz)
+def pick_and_place(follower, wp: dict[str, np.ndarray], hz: float,
+                   live_det=None, use_inference=False, servo_args=None) -> np.ndarray:
+    cmd = _grasp(follower, wp, hz, live_det, use_inference, servo_args)
 
     print("  → LIFT")
     cmd = move_to(follower, cmd, wp["lift"].copy(), hz=hz)
@@ -704,14 +878,15 @@ def pick_and_place(follower, wp: dict[str, np.ndarray], hz: float) -> np.ndarray
 
 
 def pick_and_flip(follower, wp: dict[str, np.ndarray], hz: float,
-                  flip_speed: float = np.radians(300.0)) -> np.ndarray:
+                  flip_speed: float = np.radians(300.0),
+                  live_det=None, use_inference=False, servo_args=None) -> np.ndarray:
     """
     Pick bottle → move to pre_flip → close gripper → snap fast to flip_end → open gripper.
 
     flip_speed: joint speed for the flip stroke (default 300 deg/s — 5× normal).
                 Pass np.radians(N) to adjust.
     """
-    cmd = _grasp(follower, wp, hz)
+    cmd = _grasp(follower, wp, hz, live_det, use_inference, servo_args)
 
     print("  → PRE-FLIP position")
     pre = wp["pre_flip"].copy(); pre[-1] = GRIPPER_CLOSED
@@ -737,10 +912,13 @@ def pick_and_flip(follower, wp: dict[str, np.ndarray], hz: float,
     return cmd
 
 
-def run_action(follower, wp: dict[str, np.ndarray], hz: float, action: str) -> np.ndarray:
+def run_action(follower, wp: dict[str, np.ndarray], hz: float, action: str,
+               live_det=None, use_inference=False, servo_args=None) -> np.ndarray:
     if action == "flip":
-        return pick_and_flip(follower, wp, hz, flip_speed=np.radians(args.flip_speed))
-    return pick_and_place(follower, wp, hz)
+        return pick_and_flip(follower, wp, hz, flip_speed=np.radians(args.flip_speed),
+                             live_det=live_det, use_inference=use_inference, servo_args=servo_args)
+    return pick_and_place(follower, wp, hz,
+                          live_det=live_det, use_inference=use_inference, servo_args=servo_args)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -776,9 +954,10 @@ def main():
     else:
         wp_raw = {}
 
-    follower = None
-    camera   = None
-    preview  = None
+    follower  = None
+    camera    = None
+    preview   = None
+    live_det  = None
 
     try:
         # ── arm ───────────────────────────────────────────────────────────────
@@ -828,11 +1007,21 @@ def main():
         if not args.no_preview:
             preview = PreviewWindow()
 
-        # ── YOLO ─────────────────────────────────────────────────────────────
+        # ── YOLO + live detector (always feeds preview, even during arm motion) ─
         detector = YOLOv8Detector(args.yolov8_model, args.device)
+        live_det = LiveDetector(camera, detector, args.confidence, preview)
+
+        # ── gripper init: close then open to confirm it's working ────────────
+        cmd = follower.get_joint_pos().copy() if follower else None
+        if follower and cmd is not None:
+            print("\nInitializing gripper…")
+            cmd = set_gripper(follower, cmd, GRIPPER_CLOSED, hz=args.hz)
+            time.sleep(0.4)
+            cmd = set_gripper(follower, cmd, GRIPPER_OPEN, hz=args.hz)
+            time.sleep(0.2)
+            print("  Gripper OK.")
 
         # ── main loop ─────────────────────────────────────────────────────────
-        cmd = follower.get_joint_pos().copy() if follower else None
         iteration = 0
 
         print("\n" + "═" * 60)
@@ -850,8 +1039,7 @@ def main():
 
             # Detect
             detection = scan_for_bottle(
-                camera, detector, preview,
-                conf=args.confidence,
+                live_det,
                 timeout=args.scan_timeout,
             )
 
@@ -871,7 +1059,10 @@ def main():
                 k = input().strip().lower()
                 if k == "q":
                     break
-                run_action(follower, wp, hz=args.hz, action=args.action)
+                run_action(follower, wp, hz=args.hz, action=args.action,
+                           live_det=live_det,
+                           use_inference=args.inference_grasp,
+                           servo_args=args)
                 cmd = follower.get_joint_pos().copy()
             else:
                 print("(--no-arm: detection shown, no motion)")
@@ -884,6 +1075,8 @@ def main():
         print("\nStopped.")
 
     finally:
+        if live_det:
+            live_det.stop()
         if preview:
             preview.stop()
         if camera:
